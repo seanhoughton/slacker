@@ -2,6 +2,7 @@ package slacker
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/slack-go/slack"
 )
@@ -14,6 +15,7 @@ const (
 type ResponseWriter interface {
 	Reply(text string, options ...ReplyOption) error
 	ReportError(err error, options ...ReportErrorOption)
+	FileUpload(title string, comment string, filename string, filetype string, reader io.Reader, options ...ReplyOption) error
 }
 
 // NewResponse creates a new response structure
@@ -36,9 +38,9 @@ func (r *response) ReportError(err error, options ...ReportErrorOption) {
 		slack.MsgOptionText(fmt.Sprintf(errorFormat, err.Error()), false),
 	}
 	if defaults.ThreadResponse {
-		opts = append(opts, slack.MsgOptionTS(ev.TimeStamp))
+		opts = append(opts, slack.MsgOptionTS(ev.MakeThreadTimestamp()))
 	}
-	_, _, err = client.PostMessage(ev.Channel, opts...)
+	_, _, err = client.PostMessageContext(r.botCtx.Context(), ev.Channel, opts...)
 	if err != nil {
 		fmt.Printf("failed posting message: %v\n", err)
 	}
@@ -60,12 +62,40 @@ func (r *response) Reply(message string, options ...ReplyOption) error {
 		slack.MsgOptionBlocks(defaults.Blocks...),
 	}
 	if defaults.ThreadResponse {
-		opts = append(opts, slack.MsgOptionTS(ev.TimeStamp))
+		opts = append(opts, slack.MsgOptionTS(ev.MakeThreadTimestamp()))
 	}
 
-	_, _, err := client.PostMessage(
+	_, _, err := client.PostMessageContext(
+		r.botCtx.Context(),
 		ev.Channel,
 		opts...,
 	)
+	return err
+}
+
+// FileUpload send a file to the current channel
+func (r *response) FileUpload(title string, comment string, filename string, filetype string, reader io.Reader, options ...ReplyOption) error {
+	defaults := NewReplyDefaults(options...)
+
+	client := r.botCtx.Client()
+	ev := r.botCtx.Event()
+	if ev == nil {
+		return fmt.Errorf("Unable to get message event details")
+	}
+
+	params := slack.FileUploadParameters{
+		Title:          title,
+		InitialComment: comment,
+		Reader:         reader,
+		Filename:       filename,
+		Filetype:       filetype,
+		Channels:       []string{ev.Channel},
+	}
+
+	if defaults.ThreadResponse {
+		params.ThreadTimestamp = ev.MakeThreadTimestamp()
+	}
+
+	_, err := client.UploadFileContext(r.botCtx.Context(), params)
 	return err
 }

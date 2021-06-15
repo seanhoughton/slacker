@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 
 	"github.com/shomali11/proper"
 	"github.com/slack-go/slack"
@@ -33,7 +34,7 @@ var (
 )
 
 // NewClient creates a new client using the Slack API
-func NewClient(botToken, appToken string, options ...ClientOption) *Slacker {
+func NewClient(botToken, appToken string, options ...ClientOption) (*Slacker, error) {
 	defaults := newClientDefaults(options...)
 
 	api := slack.New(
@@ -42,17 +43,26 @@ func NewClient(botToken, appToken string, options ...ClientOption) *Slacker {
 		slack.OptionAppLevelToken(appToken),
 	)
 
+	info, err := api.AuthTest()
+	if err != nil {
+		return nil, err
+	}
+
 	smc := socketmode.New(
 		api,
 		socketmode.OptionDebug(defaults.Debug),
 	)
 	slacker := &Slacker{
-		client:            api,
-		socketModeClient:  smc,
-		commandChannel:    make(chan *CommandEvent, 100),
-		unAuthorizedError: unAuthorizedError,
+		client:                api,
+		socketModeClient:      smc,
+		commandChannel:        make(chan *CommandEvent, 100),
+		unAuthorizedError:     unAuthorizedError,
+		botContextConstructor: NewBotContext,
+		requestConstructor:    NewRequest,
+		responseConstructor:   NewResponse,
+		botID:                 info.BotID,
 	}
-	return slacker
+	return slacker, nil
 }
 
 // Slacker contains the Slack API, botCommands, and handlers
@@ -60,17 +70,17 @@ type Slacker struct {
 	client                *slack.Client
 	socketModeClient      *socketmode.Client
 	botCommands           []BotCommand
+	botLinkShares         []BotLinkShare
 	botContextConstructor func(ctx context.Context, api *slack.Client, client *socketmode.Client, evt *MessageEvent) BotContext
 	requestConstructor    func(botCtx BotContext, properties *proper.Properties) Request
 	responseConstructor   func(botCtx BotContext) ResponseWriter
 	initHandler           func()
 	errorHandler          func(err string)
 	helpDefinition        *CommandDefinition
-	defaultMessageHandler func(botCtx BotContext, request Request, response ResponseWriter)
-	defaultEventHandler   func(interface{})
+	messageHandler        func(botCtx BotContext, response ResponseWriter)
 	unAuthorizedError     error
 	commandChannel        chan *CommandEvent
-	appID                 string
+	botID                 string
 }
 
 // BotCommands returns Bot Commands
@@ -108,16 +118,6 @@ func (s *Slacker) CustomResponse(responseConstructor func(botCtx BotContext) Res
 	s.responseConstructor = responseConstructor
 }
 
-// DefaultCommand handle messages when none of the commands are matched
-func (s *Slacker) DefaultCommand(defaultMessageHandler func(botCtx BotContext, request Request, response ResponseWriter)) {
-	s.defaultMessageHandler = defaultMessageHandler
-}
-
-// DefaultEvent handle events when an unknown event is seen
-func (s *Slacker) DefaultEvent(defaultEventHandler func(interface{})) {
-	s.defaultEventHandler = defaultEventHandler
-}
-
 // UnAuthorizedError error message
 func (s *Slacker) UnAuthorizedError(unAuthorizedError error) {
 	s.unAuthorizedError = unAuthorizedError
@@ -131,6 +131,16 @@ func (s *Slacker) Help(definition *CommandDefinition) {
 // Command define a new command and append it to the list of existing commands
 func (s *Slacker) Command(usage string, definition *CommandDefinition) {
 	s.botCommands = append(s.botCommands, NewBotCommand(usage, definition))
+}
+
+// LinkShare define a new link handler and append it to the list of existing link handlers
+func (s *Slacker) Link(domain string, definition *LinkShareDefinition) {
+	s.botLinkShares = append(s.botLinkShares, NewBotLinkShare(domain, definition))
+}
+
+// Message handle all messages
+func (s *Slacker) Message(messageHandler func(botCtx BotContext, response ResponseWriter)) {
+	s.messageHandler = messageHandler
 }
 
 // CommandEvents returns read only command events channel
@@ -164,6 +174,24 @@ func (s *Slacker) Listen(ctx context.Context) error {
 				case socketmode.EventTypeConnected:
 					fmt.Println("Connected to Slack with Socket Mode.")
 
+				case socketmode.EventTypeInteractive:
+					ev, ok := evt.Data.(slackevents.EventsAPIEvent)
+					if !ok {
+						fmt.Printf("Ignored %+v\n", evt)
+						continue
+					}
+					s.handleInteractionEvent(ctx, ev.InnerEvent.Data)
+					s.socketModeClient.Ack(*evt.Request)
+
+				case socketmode.EventTypeSlashCommand:
+					ev, ok := evt.Data.(slack.SlashCommand)
+					if !ok {
+						fmt.Printf("Ignored %+v\n", evt)
+						continue
+					}
+					s.handleCommandEvent(ctx, &ev)
+					s.socketModeClient.Ack(*evt.Request)
+
 				case socketmode.EventTypeEventsAPI:
 					ev, ok := evt.Data.(slackevents.EventsAPIEvent)
 					if !ok {
@@ -172,9 +200,8 @@ func (s *Slacker) Listen(ctx context.Context) error {
 					}
 
 					switch ev.InnerEvent.Type {
-					case "message", "app_mention": // message-based events
+					case slackevents.Message, slackevents.AppMention, slackevents.LinkShared: // message-based events
 						go s.handleMessageEvent(ctx, ev.InnerEvent.Data)
-
 					default:
 						fmt.Printf("unsupported inner event: %+v\n", ev.InnerEvent.Type)
 					}
@@ -249,26 +276,21 @@ func (s *Slacker) prependHelpHandle() {
 	s.botCommands = append([]BotCommand{NewBotCommand(helpCommand, s.helpDefinition)}, s.botCommands...)
 }
 
-func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
-	if s.botContextConstructor == nil {
-		s.botContextConstructor = NewBotContext
+func (s *Slacker) handleInteractionEvent(ctx context.Context, evt interface{}) {
+}
+
+func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashCommand) {
+	ev := &MessageEvent{
+		Channel: evt.ChannelID,
+		User:    evt.UserID,
+		Text:    evt.Text,
+		Data:    evt,
+		//Type:            slackevents.SlashCommand,
+		//Timestamp:       ev.,
+		//ThreadTimeStamp: ev.ThreadTimeStamp,
 	}
 
-	if s.requestConstructor == nil {
-		s.requestConstructor = NewRequest
-	}
-
-	if s.responseConstructor == nil {
-		s.responseConstructor = NewResponse
-	}
-
-	ev := newMessageEvent(evt)
-	if ev == nil {
-		// event doesn't appear to be a valid message type
-		return
-	}
-
-	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, ev)
+	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, ev) // note: nil message event
 	response := s.responseConstructor(botCtx)
 
 	for _, cmd := range s.botCommands {
@@ -294,12 +316,45 @@ func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
 	}
 }
 
+func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
+	ev := newMessageEvent(evt)
+	if ev == nil {
+		// event doesn't appear to be a valid message type
+		return
+	}
+
+	if ev.BotID == s.botID {
+		// ignore messages this bot posted
+		return
+	}
+
+	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, ev)
+	response := s.responseConstructor(botCtx)
+
+	if linkEvt, ok := ev.Data.(*slackevents.LinkSharedEvent); ok {
+		for _, link := range s.botLinkShares {
+			for _, domain := range linkEvt.Links {
+				if link.Domain() == domain.Domain {
+					if value, err := url.Parse(domain.URL); err != nil {
+						// bad URL
+					} else {
+						link.Execute(botCtx, value, response)
+					}
+				}
+			}
+		}
+	}
+
+	if s.messageHandler != nil {
+		s.messageHandler(botCtx, response)
+	}
+}
+
 func newMessageEvent(evt interface{}) *MessageEvent {
 	var me *MessageEvent
 
-	switch evt.(type) {
+	switch ev := evt.(type) {
 	case *slackevents.MessageEvent:
-		ev := evt.(*slackevents.MessageEvent)
 		me = &MessageEvent{
 			Channel:         ev.Channel,
 			User:            ev.User,
@@ -311,7 +366,6 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			BotID:           ev.BotID,
 		}
 	case *slackevents.AppMentionEvent:
-		ev := evt.(*slackevents.AppMentionEvent)
 		me = &MessageEvent{
 			Channel:         ev.Channel,
 			User:            ev.User,
@@ -322,15 +376,24 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			ThreadTimeStamp: ev.ThreadTimeStamp,
 			BotID:           ev.BotID,
 		}
+	case *slackevents.LinkSharedEvent:
+		me = &MessageEvent{
+			Channel:         ev.Channel,
+			User:            ev.User,
+			Data:            evt,
+			Type:            ev.Type,
+			TimeStamp:       string(ev.MessageTimeStamp),
+			ThreadTimeStamp: ev.ThreadTimeStamp,
+		}
 	}
 
 	// Filter out other bots. At the very least this is needed for MessageEvent
 	// to prevent the bot from self-triggering and causing loops. However better
 	// logic should be in place to prevent repeated self-triggering / bot-storms
 	// if we want to enable this later.
-	if me.IsBot() {
-		return nil
-	}
+	//if me.IsBot() {
+	//	return nil
+	//}
 
 	return me
 }
