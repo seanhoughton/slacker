@@ -79,6 +79,14 @@ type MessageEvent struct {
 	BotID string
 }
 
+func (e *MessageEvent) MakeThreadTimestamp() string {
+	if e.ThreadTimeStamp != "" {
+		return e.ThreadTimeStamp
+	} else {
+		return e.TimeStamp
+	}
+}
+
 // IsThread indicates if a message event took place in a thread.
 func (e *MessageEvent) IsThread() bool {
 	if e.ThreadTimeStamp == "" || e.ThreadTimeStamp == e.TimeStamp {
