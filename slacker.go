@@ -67,20 +67,22 @@ func NewClient(botToken, appToken string, options ...ClientOption) (*Slacker, er
 
 // Slacker contains the Slack API, botCommands, and handlers
 type Slacker struct {
-	client                *slack.Client
-	socketModeClient      *socketmode.Client
-	botCommands           []BotCommand
-	botLinkShares         []BotLinkShare
-	botContextConstructor func(ctx context.Context, api *slack.Client, client *socketmode.Client, evt *MessageEvent) BotContext
-	requestConstructor    func(botCtx BotContext, properties *proper.Properties) Request
-	responseConstructor   func(botCtx BotContext) ResponseWriter
-	initHandler           func()
-	errorHandler          func(err string)
-	helpDefinition        *CommandDefinition
-	messageHandler        func(botCtx BotContext, response ResponseWriter)
-	unAuthorizedError     error
-	commandChannel        chan *CommandEvent
-	botID                 string
+	client                  *slack.Client
+	socketModeClient        *socketmode.Client
+	botCommands             []BotCommand
+	botLinkShares           []BotLinkShare
+	botContextConstructor   func(ctx context.Context, api *slack.Client, client *socketmode.Client, evt *MessageEvent) BotContext
+	requestConstructor      func(botCtx BotContext, properties *proper.Properties) Request
+	responseConstructor     func(botCtx BotContext) ResponseWriter
+	interactiveEventHandler func(botCtx botContext, response ResponseWriter)
+	initHandler             func()
+	errorHandler            func(err string)
+	helpDefinition          *CommandDefinition
+	interactionHandler      func(botCtx BotContext, response ResponseWriter, callback_id string, block_id string, action_id string, value string)
+	messageHandler          func(botCtx BotContext, response ResponseWriter)
+	unAuthorizedError       error
+	commandChannel          chan *CommandEvent
+	botID                   string
 }
 
 // BotCommands returns Bot Commands
@@ -138,6 +140,11 @@ func (s *Slacker) Link(domain string, definition *LinkShareDefinition) {
 	s.botLinkShares = append(s.botLinkShares, NewBotLinkShare(domain, definition))
 }
 
+// Interact handles all actions from buttons
+func (s *Slacker) Interact(interactionHandler func(botCtx BotContext, response ResponseWriter, callback_id string, block_id string, action_id string, value string)) {
+	s.interactionHandler = interactionHandler
+}
+
 // Message handle all messages
 func (s *Slacker) Message(messageHandler func(botCtx BotContext, response ResponseWriter)) {
 	s.messageHandler = messageHandler
@@ -175,12 +182,17 @@ func (s *Slacker) Listen(ctx context.Context) error {
 					fmt.Println("Connected to Slack with Socket Mode.")
 
 				case socketmode.EventTypeInteractive:
-					ev, ok := evt.Data.(slackevents.EventsAPIEvent)
+
+					if s.interactiveEventHandler == nil {
+						fmt.Printf("Ignored %+v\n", evt)
+						continue
+					}
+					callback, ok := evt.Data.(slack.InteractionCallback)
 					if !ok {
 						fmt.Printf("Ignored %+v\n", evt)
 						continue
 					}
-					s.handleInteractionEvent(ctx, ev.InnerEvent.Data)
+					s.handleInteractionEvent(ctx, &callback)
 					s.socketModeClient.Ack(*evt.Request)
 
 				case socketmode.EventTypeSlashCommand:
@@ -276,7 +288,18 @@ func (s *Slacker) prependHelpHandle() {
 	s.botCommands = append([]BotCommand{NewBotCommand(helpCommand, s.helpDefinition)}, s.botCommands...)
 }
 
-func (s *Slacker) handleInteractionEvent(ctx context.Context, evt interface{}) {
+func (s *Slacker) handleInteractionEvent(ctx context.Context, callback *slack.InteractionCallback) {
+	me := &MessageEvent{
+		Channel: callback.Channel.ID,
+		User:    callback.User.ID,
+		Text:    "",
+		Data:    callback,
+		Type:    string(callback.Type),
+	}
+	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, me)
+	response := s.responseConstructor(botCtx)
+
+	s.interactionHandler(botCtx, response, callback.CallbackID, callback.BlockID, callback.ActionID, callback.Value)
 }
 
 func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashCommand) {
@@ -395,5 +418,16 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 	//	return nil
 	//}
 
+	return me
+}
+
+func actionToMessageEvent(callback *slack.InteractionCallback) *MessageEvent {
+	me := &MessageEvent{
+		Channel: callback.Channel.ID,
+		User:    callback.User.ID,
+		Text:    "",
+		Data:    callback,
+		Type:    string(callback.Type),
+	}
 	return me
 }
