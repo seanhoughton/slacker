@@ -298,8 +298,9 @@ func (s *Slacker) handleInteractionEvent(ctx context.Context, callback *slack.In
 	}
 	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, me)
 	response := s.responseConstructor(botCtx)
+	action := callback.ActionCallback.BlockActions[0]
 
-	s.interactionHandler(botCtx, response, callback.CallbackID, callback.BlockID, callback.ActionID, callback.Value)
+	s.interactionHandler(botCtx, response, callback.CallbackID, action.BlockID, action.ActionID, action.Value)
 }
 
 func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashCommand) {
