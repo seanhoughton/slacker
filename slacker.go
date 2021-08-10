@@ -67,20 +67,22 @@ func NewClient(botToken, appToken string, options ...ClientOption) (*Slacker, er
 
 // Slacker contains the Slack API, botCommands, and handlers
 type Slacker struct {
-	client                *slack.Client
-	socketModeClient      *socketmode.Client
-	botCommands           []BotCommand
-	botLinkShares         []BotLinkShare
-	botContextConstructor func(ctx context.Context, api *slack.Client, client *socketmode.Client, evt *MessageEvent) BotContext
-	requestConstructor    func(botCtx BotContext, properties *proper.Properties) Request
-	responseConstructor   func(botCtx BotContext) ResponseWriter
-	initHandler           func()
-	errorHandler          func(err string)
-	helpDefinition        *CommandDefinition
-	messageHandler        func(botCtx BotContext, response ResponseWriter)
-	unAuthorizedError     error
-	commandChannel        chan *CommandEvent
-	botID                 string
+	client                  *slack.Client
+	socketModeClient        *socketmode.Client
+	botCommands             []BotCommand
+	botLinkShares           []BotLinkShare
+	botContextConstructor   func(ctx context.Context, api *slack.Client, client *socketmode.Client, evt *MessageEvent) BotContext
+	requestConstructor      func(botCtx BotContext, properties *proper.Properties) Request
+	responseConstructor     func(botCtx BotContext) ResponseWriter
+	interactiveEventHandler func(botCtx botContext, response ResponseWriter)
+	initHandler             func()
+	errorHandler            func(err string)
+	helpDefinition          *CommandDefinition
+	interactionHandler      func(botCtx BotContext, response ResponseWriter, callback_id string, block_id string, action_id string, value string)
+	messageHandler          func(botCtx BotContext, response ResponseWriter)
+	unAuthorizedError       error
+	commandChannel          chan *CommandEvent
+	botID                   string
 }
 
 // BotCommands returns Bot Commands
@@ -138,6 +140,11 @@ func (s *Slacker) Link(domain string, definition *LinkShareDefinition) {
 	s.botLinkShares = append(s.botLinkShares, NewBotLinkShare(domain, definition))
 }
 
+// Interact handles all actions from buttons
+func (s *Slacker) Interact(interactionHandler func(botCtx BotContext, response ResponseWriter, callback_id string, block_id string, action_id string, value string)) {
+	s.interactionHandler = interactionHandler
+}
+
 // Message handle all messages
 func (s *Slacker) Message(messageHandler func(botCtx BotContext, response ResponseWriter)) {
 	s.messageHandler = messageHandler
@@ -175,12 +182,17 @@ func (s *Slacker) Listen(ctx context.Context) error {
 					fmt.Println("Connected to Slack with Socket Mode.")
 
 				case socketmode.EventTypeInteractive:
-					ev, ok := evt.Data.(slackevents.EventsAPIEvent)
+
+					if s.interactiveEventHandler == nil {
+						fmt.Printf("Ignored %+v\n", evt)
+						continue
+					}
+					callback, ok := evt.Data.(slack.InteractionCallback)
 					if !ok {
 						fmt.Printf("Ignored %+v\n", evt)
 						continue
 					}
-					s.handleInteractionEvent(ctx, ev.InnerEvent.Data)
+					s.handleInteractionEvent(ctx, &callback)
 					s.socketModeClient.Ack(*evt.Request)
 
 				case socketmode.EventTypeSlashCommand:
@@ -201,7 +213,7 @@ func (s *Slacker) Listen(ctx context.Context) error {
 
 					switch ev.InnerEvent.Type {
 					case slackevents.Message, slackevents.AppMention, slackevents.LinkShared: // message-based events
-						go s.handleMessageEvent(ctx, ev.InnerEvent.Data)
+						go s.handleMessageEvent(ctx, ev.InnerEvent.Data, ev.TeamID)
 					default:
 						fmt.Printf("unsupported inner event: %+v\n", ev.InnerEvent.Type)
 					}
@@ -276,7 +288,20 @@ func (s *Slacker) prependHelpHandle() {
 	s.botCommands = append([]BotCommand{NewBotCommand(helpCommand, s.helpDefinition)}, s.botCommands...)
 }
 
-func (s *Slacker) handleInteractionEvent(ctx context.Context, evt interface{}) {
+func (s *Slacker) handleInteractionEvent(ctx context.Context, callback *slack.InteractionCallback) {
+	me := &MessageEvent{
+		Channel: callback.Channel.ID,
+		User:    callback.User.ID,
+		Text:    "",
+		Data:    callback,
+		Type:    string(callback.Type),
+		TeamID:  callback.Team.ID,
+	}
+	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, me)
+	response := s.responseConstructor(botCtx)
+	action := callback.ActionCallback.BlockActions[0]
+
+	s.interactionHandler(botCtx, response, callback.CallbackID, action.BlockID, action.ActionID, action.Value)
 }
 
 func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashCommand) {
@@ -285,6 +310,7 @@ func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashComman
 		User:    evt.UserID,
 		Text:    evt.Text,
 		Data:    evt,
+		TeamID:  evt.TeamID,
 		//Type:            slackevents.SlashCommand,
 		//Timestamp:       ev.,
 		//ThreadTimeStamp: ev.ThreadTimeStamp,
@@ -316,8 +342,8 @@ func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashComman
 	}
 }
 
-func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
-	ev := newMessageEvent(evt)
+func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}, teamID string) {
+	ev := newMessageEvent(evt, teamID)
 	if ev == nil {
 		// event doesn't appear to be a valid message type
 		return
@@ -350,7 +376,7 @@ func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
 	}
 }
 
-func newMessageEvent(evt interface{}) *MessageEvent {
+func newMessageEvent(evt interface{}, teamID string) *MessageEvent {
 	var me *MessageEvent
 
 	switch ev := evt.(type) {
@@ -364,6 +390,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			TimeStamp:       ev.TimeStamp,
 			ThreadTimeStamp: ev.ThreadTimeStamp,
 			BotID:           ev.BotID,
+			TeamID:          teamID,
 		}
 	case *slackevents.AppMentionEvent:
 		me = &MessageEvent{
@@ -375,6 +402,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			TimeStamp:       ev.TimeStamp,
 			ThreadTimeStamp: ev.ThreadTimeStamp,
 			BotID:           ev.BotID,
+			TeamID:          teamID,
 		}
 	case *slackevents.LinkSharedEvent:
 		me = &MessageEvent{
@@ -384,6 +412,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			Type:            ev.Type,
 			TimeStamp:       string(ev.MessageTimeStamp),
 			ThreadTimeStamp: ev.ThreadTimeStamp,
+			TeamID:          teamID,
 		}
 	}
 

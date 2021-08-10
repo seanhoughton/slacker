@@ -77,6 +77,9 @@ type MessageEvent struct {
 
 	// BotID holds the Slack User ID for our bot
 	BotID string
+
+	// TeamID holds the Team ID that the Event was sent to
+	TeamID string
 }
 
 func (e *MessageEvent) MakeThreadTimestamp() string {
