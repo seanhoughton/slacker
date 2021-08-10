@@ -213,7 +213,7 @@ func (s *Slacker) Listen(ctx context.Context) error {
 
 					switch ev.InnerEvent.Type {
 					case slackevents.Message, slackevents.AppMention, slackevents.LinkShared: // message-based events
-						go s.handleMessageEvent(ctx, ev.InnerEvent.Data)
+						go s.handleMessageEvent(ctx, ev.InnerEvent.Data, ev.TeamID)
 					default:
 						fmt.Printf("unsupported inner event: %+v\n", ev.InnerEvent.Type)
 					}
@@ -295,6 +295,7 @@ func (s *Slacker) handleInteractionEvent(ctx context.Context, callback *slack.In
 		Text:    "",
 		Data:    callback,
 		Type:    string(callback.Type),
+		TeamID:  callback.Team.ID,
 	}
 	botCtx := s.botContextConstructor(ctx, s.client, s.socketModeClient, me)
 	response := s.responseConstructor(botCtx)
@@ -309,6 +310,7 @@ func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashComman
 		User:    evt.UserID,
 		Text:    evt.Text,
 		Data:    evt,
+		TeamID:  evt.TeamID,
 		//Type:            slackevents.SlashCommand,
 		//Timestamp:       ev.,
 		//ThreadTimeStamp: ev.ThreadTimeStamp,
@@ -340,8 +342,8 @@ func (s *Slacker) handleCommandEvent(ctx context.Context, evt *slack.SlashComman
 	}
 }
 
-func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
-	ev := newMessageEvent(evt)
+func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}, teamID string) {
+	ev := newMessageEvent(evt, teamID)
 	if ev == nil {
 		// event doesn't appear to be a valid message type
 		return
@@ -374,7 +376,7 @@ func (s *Slacker) handleMessageEvent(ctx context.Context, evt interface{}) {
 	}
 }
 
-func newMessageEvent(evt interface{}) *MessageEvent {
+func newMessageEvent(evt interface{}, teamID string) *MessageEvent {
 	var me *MessageEvent
 
 	switch ev := evt.(type) {
@@ -388,6 +390,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			TimeStamp:       ev.TimeStamp,
 			ThreadTimeStamp: ev.ThreadTimeStamp,
 			BotID:           ev.BotID,
+			TeamID:          teamID,
 		}
 	case *slackevents.AppMentionEvent:
 		me = &MessageEvent{
@@ -399,6 +402,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			TimeStamp:       ev.TimeStamp,
 			ThreadTimeStamp: ev.ThreadTimeStamp,
 			BotID:           ev.BotID,
+			TeamID:          teamID,
 		}
 	case *slackevents.LinkSharedEvent:
 		me = &MessageEvent{
@@ -408,6 +412,7 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 			Type:            ev.Type,
 			TimeStamp:       string(ev.MessageTimeStamp),
 			ThreadTimeStamp: ev.ThreadTimeStamp,
+			TeamID:          teamID,
 		}
 	}
 
@@ -419,16 +424,5 @@ func newMessageEvent(evt interface{}) *MessageEvent {
 	//	return nil
 	//}
 
-	return me
-}
-
-func actionToMessageEvent(callback *slack.InteractionCallback) *MessageEvent {
-	me := &MessageEvent{
-		Channel: callback.Channel.ID,
-		User:    callback.User.ID,
-		Text:    "",
-		Data:    callback,
-		Type:    string(callback.Type),
-	}
 	return me
 }
